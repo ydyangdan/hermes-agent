@@ -95,6 +95,36 @@ def terminate_pid(pid: int, *, force: bool = False) -> None:
     os.kill(pid, sig)
 
 
+def _pid_exists(pid: int) -> bool:
+    """Return True if a process with this PID exists on the current platform."""
+    if pid <= 0:
+        return False
+    if _IS_WINDOWS:
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return False
+        if result.returncode != 0:
+            return False
+        output = (result.stdout or "").strip()
+        return bool(output) and "INFO:" not in output and str(pid) in output
+
+    try:
+        os.kill(pid, 0)  # signal 0 = existence check, no actual signal sent
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 def _scope_hash(identity: str) -> str:
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
 
@@ -214,7 +244,10 @@ def _read_pid_record(pid_path: Optional[Path] = None) -> Optional[dict]:
     if not pid_path.exists():
         return None
 
-    raw = pid_path.read_text().strip()
+    try:
+        raw = pid_path.read_text().strip()
+    except OSError:
+        return None
     if not raw:
         return None
 
@@ -234,7 +267,22 @@ def _read_pid_record(pid_path: Optional[Path] = None) -> Optional[dict]:
 
 
 def _read_gateway_lock_record(lock_path: Optional[Path] = None) -> Optional[dict[str, Any]]:
-    return _read_pid_record(lock_path or _get_gateway_lock_path())
+    global _gateway_lock_handle
+    resolved_lock_path = lock_path or _get_gateway_lock_path()
+    if _gateway_lock_handle is not None and resolved_lock_path == _get_gateway_lock_path():
+        try:
+            _gateway_lock_handle.seek(0)
+            raw = _gateway_lock_handle.read().strip()
+        except OSError:
+            return None
+        if not raw:
+            return None
+        try:
+            record = json.loads(raw)
+            return record if isinstance(record, dict) else None
+        except (json.JSONDecodeError, TypeError):
+            return None
+    return _read_pid_record(resolved_lock_path)
 
 
 def _pid_from_record(record: Optional[dict[str, Any]]) -> Optional[int]:
@@ -435,6 +483,31 @@ def write_runtime_status(
 def read_runtime_status() -> Optional[dict[str, Any]]:
     """Read the persisted gateway runtime health/status information."""
     return _read_json_file(_get_runtime_status_path())
+
+
+def _runtime_status_pid_if_alive() -> Optional[int]:
+    """Return the live gateway PID from runtime status when pid/lock files are absent."""
+    record = read_runtime_status()
+    if not record:
+        return None
+    if record.get("gateway_state") not in {"starting", "running"}:
+        return None
+
+    pid = _pid_from_record(record)
+    if pid is None:
+        return None
+
+    if not _pid_exists(pid):
+        return None
+
+    recorded_start = record.get("start_time")
+    current_start = _get_process_start_time(pid)
+    if recorded_start is not None and current_start is not None and current_start != recorded_start:
+        return None
+
+    if _looks_like_gateway_process(pid) or _record_looks_like_gateway(record):
+        return pid
+    return None
 
 
 def remove_pid_file() -> None:
@@ -753,6 +826,9 @@ def get_running_pid(
     resolved_lock_path = _get_gateway_lock_path(resolved_pid_path)
     lock_active = is_gateway_runtime_lock_active(resolved_lock_path)
     if not lock_active:
+        runtime_pid = _runtime_status_pid_if_alive()
+        if runtime_pid is not None:
+            return runtime_pid
         _cleanup_invalid_pid_path(resolved_pid_path, cleanup_stale=cleanup_stale)
         return None
 
@@ -764,20 +840,7 @@ def get_running_pid(
         if pid is None:
             continue
 
-        try:
-            os.kill(pid, 0)  # signal 0 = existence check, no actual signal sent
-        except ProcessLookupError:
-            continue
-        except PermissionError:
-            # The process exists but belongs to another user/service scope.
-            # With the runtime lock still held, prefer keeping it visible
-            # rather than deleting the PID file as "stale".
-            if _record_looks_like_gateway(record):
-                return pid
-            continue
-        except OSError:
-            # Windows raises OSError with WinError 87 for an invalid pid
-            # (process is definitely gone). Treat as "process doesn't exist".
+        if not _pid_exists(pid):
             continue
 
         recorded_start = record.get("start_time")
